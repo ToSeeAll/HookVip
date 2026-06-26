@@ -1,0 +1,162 @@
+name: Android CI/CD
+
+on:
+  # 推送到主分支时触发
+  push:
+    branches: [ main, master ]
+    tags:
+      - 'v*'
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '构建类型'
+        required: true
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - release
+
+# 并发控制，避免同一分支/tag同时运行多个工作流
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 检出代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 设置 JDK 17
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'gradle'
+
+      # 设置 Gradle
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # 安装 Android Build Tools
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      # 授予执行权限
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # 构建调试版本（用于非 release 触发）
+      - name: Build Debug APK
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+        run: ./gradlew assembleDebug
+
+      # 构建发布版本（用于 tag 触发或手动触发 release）
+      - name: Build Release APK
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
+        run: ./gradlew assembleRelease
+
+      # 签名 APK（使用 GitHub 原生工具）
+      - name: Sign Release APK
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          # 创建 keystore 文件
+          echo "$SIGNING_KEY" | base64 -d > signing.jks
+          
+          # 查找未签名的 APK
+          UNSIGNED_APK=$(find app/build/outputs/apk -name "*-release*.apk" | grep -v signed | head -n 1)
+          
+          if [ -z "$UNSIGNED_APK" ]; then
+            echo "Error: 未找到未签名的 APK 文件"
+            exit 1
+          fi
+          
+          echo "找到 APK: $UNSIGNED_APK"
+          
+          # 获取 build-tools 版本
+          BUILD_TOOLS_VERSION=$(ls $ANDROID_SDK_ROOT/build-tools/ | sort -V | tail -n 1)
+          echo "使用 Build Tools 版本: $BUILD_TOOLS_VERSION"
+          
+          # 使用 Android SDK 的 apksigner 进行签名
+          $ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner sign \
+            --ks signing.jks \
+            --ks-key-alias "$ALIAS" \
+            --ks-pass "pass:$KEY_STORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --out HookVIP-signed.apk \
+            "$UNSIGNED_APK"
+          
+          # 清理 keystore 文件
+          rm -f signing.jks
+          
+          # 生成 SHA256 校验和
+          sha256sum HookVIP-signed.apk > HookVIP.SHA256
+          
+          # 重命名为最终文件名
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG_NAME=${GITHUB_REF#refs/tags/}
+            mv HookVIP-signed.apk HookVIP-${TAG_NAME}.apk
+            mv HookVIP.SHA256 HookVIP-${TAG_NAME}.SHA256
+            echo "APK_FILE=HookVIP-${TAG_NAME}.apk" >> $GITHUB_ENV
+          else
+            TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+            mv HookVIP-signed.apk HookVIP-${TIMESTAMP}.apk
+            mv HookVIP.SHA256 HookVIP-${TIMESTAMP}.SHA256
+            echo "APK_FILE=HookVIP-${TIMESTAMP}.apk" >> $GITHUB_ENV
+          fi
+
+      # 上传构建产物（非 tag 触发时）
+      - name: Upload Debug APK
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+        uses: actions/upload-artifact@v4
+        with:
+          name: HookVIP-Debug
+          path: app/build/outputs/apk/debug/*.apk
+
+      # 上传构建产物（tag 触发或手动触发 release 时）
+      - name: Upload Release APK
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && github.event.inputs.build_type == 'release')
+        uses: actions/upload-artifact@v4
+        with:
+          name: HookVIP-Release
+          path: |
+            HookVIP-*.apk
+            HookVIP-*.SHA256
+
+      # 创建 GitHub Release（仅 tag 触发时）
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: HookVIP ${{ github.ref_name }}
+          body: |
+            ## HookVIP ${{ github.ref_name }}
+            
+            ### 更新说明
+            请在此处添加更新说明
+            
+            ### 校验和
+            SHA256 校验和请见附件 `HookVIP-${{ github.ref_name }}.SHA256` 文件
+            
+            ### 下载说明
+            - `HookVIP-${{ github.ref_name }}.apk` - 主安装包
+            
+          files: |
+            HookVIP-${{ github.ref_name }}.apk
+            HookVIP-${{ github.ref_name }}.SHA256
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
